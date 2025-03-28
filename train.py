@@ -742,7 +742,6 @@ class 模型训练器:
             
             # 在分布式训练中，确保所有进程同步
             if self.配置.分布式训练:
-                import torch.distributed as dist
                 dist.barrier()
         
         # 保存最终模型（只在主进程）
@@ -834,7 +833,6 @@ class 模型训练器:
         
         # 在分布式训练中，确保所有进程都能访问检查点文件
         if self.配置.分布式训练:
-            import torch.distributed as dist
             dist.barrier()
             
         logging.info(f"从检查点 {检查点路径} 恢复训练状态")
