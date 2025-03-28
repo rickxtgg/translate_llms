@@ -464,16 +464,21 @@ class 模型训练器:
         self.模型.train()
         总损失 = 0
         总样本数 = 0
-        总步数 = len(self.训练数据加载器)
+        训练开始时间 = time.time()
         
-        # 在分布式训练中，设置sampler的epoch
+        # 在分布式训练中，设置训练sampler的epoch
         if self.配置.分布式训练 and hasattr(self.训练数据加载器.sampler, 'set_epoch'):
             self.训练数据加载器.sampler.set_epoch(self.当前轮数)
             logging.debug(f"设置训练采样器epoch为: {self.当前轮数}")
         
         # 只在主进程显示进度条
         if not self.配置.分布式训练 or self.配置.主进程:
-            进度条 = tqdm(self.训练数据加载器, desc=f"训练轮次 {self.当前轮数 + 1}/{self.配置.训练轮数}")
+            进度条 = tqdm(
+                self.训练数据加载器, 
+                desc=f"训练轮次 {self.当前轮数 + 1}/{self.配置.训练轮数}",
+                postfix=dict(损失=0.0, 困惑度=0.0, 学习率=self.优化器.param_groups[0]['lr']),
+                unit="批次"
+            )
             进度条迭代器 = 进度条
         else:
             进度条迭代器 = self.训练数据加载器
@@ -517,32 +522,30 @@ class 模型训练器:
             当前平均损失 = 总损失 / 总样本数
             当前困惑度 = math.exp(当前平均损失)
             
-            # 只在主进程更新进度条和记录日志
+            # 更新进度条
             if not self.配置.分布式训练 or self.配置.主进程:
-                # 更新进度条
-                if hasattr(进度条迭代器, 'set_postfix'):
-                    进度条迭代器.set_postfix({
-                        '损失': f"{当前平均损失:.4f}",
-                        '困惑度': f"{当前困惑度:.2f}",
-                        '学习率': f"{self.优化器.param_groups[0]['lr']:.6f}"
-                    })
+                进度条.set_postfix(
+                    损失=当前平均损失, 
+                    困惑度=当前困惑度,
+                    学习率=self.优化器.param_groups[0]['lr']
+                )
+            
+            # 定期记录日志
+            if (步数 + 1) % self.配置.日志间隔 == 0 and (not self.配置.分布式训练 or self.配置.主进程):
+                logging.info(
+                    f"轮次 {self.当前轮数 + 1}/{self.配置.训练轮数} | "
+                    f"步数 {步数 + 1}/{len(self.训练数据加载器)} | "
+                    f"批次损失: {损失.item():.4f} | "
+                    f"批次困惑度: {math.exp(损失.item()):.2f} | "
+                    f"学习率: {self.优化器.param_groups[0]['lr']:.6f}"
+                )
                 
                 # 记录TensorBoard数据
                 if self.tensorboard_writer is not None:
-                    global_step = self.当前轮数 * 总步数 + 步数
-                    self.tensorboard_writer.add_scalar('训练/批次损失', 损失.item(), global_step)
-                    self.tensorboard_writer.add_scalar('训练/批次困惑度', math.exp(损失.item()), global_step)
-                    self.tensorboard_writer.add_scalar('训练/学习率', self.优化器.param_groups[0]['lr'], global_step)
-                
-                # 定期日志记录
-                if 步数 % self.配置.日志间隔 == 0:
-                    logging.info(
-                        f"轮次 {self.当前轮数 + 1}/{self.配置.训练轮数} | "
-                        f"步数 {步数}/{总步数} | "
-                        f"批次损失: {损失.item():.4f} | "
-                        f"批次困惑度: {math.exp(损失.item()):.2f} | "
-                        f"学习率: {self.优化器.param_groups[0]['lr']:.6f}"
-                    )
+                    全局步数 = self.当前轮数 * len(self.训练数据加载器) + 步数
+                    self.tensorboard_writer.add_scalar('训练/当前损失', 损失.item(), 全局步数)
+                    self.tensorboard_writer.add_scalar('训练/当前困惑度', math.exp(损失.item()), 全局步数)
+                    self.tensorboard_writer.add_scalar('训练/学习率', self.优化器.param_groups[0]['lr'], 全局步数)
         
         # 在分布式训练中，收集所有进程的损失
         if self.配置.分布式训练:
@@ -558,7 +561,7 @@ class 模型训练器:
             总样本数 = 总样本数张量.item()
 
             # 添加同步点，确保所有进程都完成了数据处理
-            dist.barrier()
+            dist.barrier(device_ids=[self.配置.本地排名] if torch.cuda.is_available() else None)
         
         # 计算并记录epoch平均损失
         epoch平均损失 = 总损失 / 总样本数
@@ -576,7 +579,7 @@ class 模型训练器:
                 f"训练轮次 {self.当前轮数 + 1} 完成 | "
                 f"平均损失: {epoch平均损失:.4f} | "
                 f"困惑度: {epoch困惑度:.2f} | "
-                f"耗时: {time.time() - self.训练开始时间:.2f}秒"
+                f"耗时: {time.time() - 训练开始时间:.2f}秒"
             )
         
         return epoch平均损失
@@ -742,7 +745,9 @@ class 模型训练器:
             
             # 在分布式训练中，确保所有进程同步
             if self.配置.分布式训练:
-                dist.barrier()
+                # 注释掉重复的导入语句
+                # import torch.distributed as dist
+                dist.barrier(device_ids=[self.配置.本地排名] if torch.cuda.is_available() else None)
         
         # 保存最终模型（只在主进程）
         if not self.配置.分布式训练 or self.配置.主进程:
@@ -804,7 +809,7 @@ class 模型训练器:
         
         # 在分布式训练中，确保所有进程都能访问模型文件
         if self.配置.分布式训练:
-            dist.barrier()
+            dist.barrier(device_ids=[self.配置.本地排名] if torch.cuda.is_available() else None)
             
         检查点 = torch.load(加载路径, map_location=self.配置.设备)
         
@@ -833,7 +838,9 @@ class 模型训练器:
         
         # 在分布式训练中，确保所有进程都能访问检查点文件
         if self.配置.分布式训练:
-            dist.barrier()
+            # 注释掉重复的导入语句
+            # import torch.distributed as dist
+            dist.barrier(device_ids=[self.配置.本地排名] if torch.cuda.is_available() else None)
             
         logging.info(f"从检查点 {检查点路径} 恢复训练状态")
         检查点 = torch.load(检查点路径, map_location=self.配置.设备)
@@ -1188,7 +1195,7 @@ def 分布式训练进程(本地排名, 配置):
 
         # 确保所有进程在继续之前同步
         if 配置.分布式训练:
-            dist.barrier()
+            dist.barrier(device_ids=[配置.本地排名] if torch.cuda.is_available() else None)
             
         # 创建分布式采样器
         训练采样器 = torch.utils.data.distributed.DistributedSampler(
@@ -1248,7 +1255,7 @@ def 分布式训练进程(本地排名, 配置):
         
         # 确保所有进程在继续之前同步
         if 配置.分布式训练:
-            dist.barrier()
+            dist.barrier(device_ids=[配置.本地排名] if torch.cuda.is_available() else None)
             
         # 初始化训练器
         if 配置.主进程:
@@ -1659,7 +1666,7 @@ def 准备分词器(配置, 训练数据集):
             分词器 = _训练分词器(配置, 训练数据集)
         
         # 同步所有进程
-        dist.barrier()
+        dist.barrier(device_ids=[配置.本地排名] if torch.cuda.is_available() else None)
         
         # 非主进程加载已训练好的分词器
         if not 配置.主进程:
